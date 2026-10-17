@@ -1,0 +1,12 @@
+{
+  "allowlist": [
+    {
+      "source_id": "security-ci:554fab28b3696ea313b72856",
+      "tool": "semgrep",
+      "rule": "python.jwt.security.jwt-hardcode.jwt-python-hardcoded-secret",
+      "path_contains": "mcp-server/test_token_verifier.py",
+      "owner": "security",
+      "reason": "Accepted false positive. The 'secret' literal is an HS256 test fixture in test_hs256_shared_secret_token_is_rejected (mcp-server/test_token_verifier.py:62 at current head), which asserts ShizuhaTokenVerifier REJECTS shared-secret/HS256 tokens (RS256/JWKS-only). Not a production credential."
+    }
+  ]
+}

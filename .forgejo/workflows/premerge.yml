@@ -1,0 +1,27 @@
+# MAIL-86: PR-gating deploy-contract test job. Runs the Mail deploy workflow
+# contract suite (including .forgejo/scripts/verify_deploy_values_path.py, the
+# MAIL-80 retry-contract verifier) on every pull_request so a broken test-only
+# change cannot red-light the backend/frontend deploy workflows only after
+# landing. Forgejo branch protection requires the `premerge / deploy-contract
+# (pull_request)` context before any merge to the default branch.
+#
+# Deployment execution stays push-only (deploy.yml / deploy-frontend.yml are
+# NOT triggered here) — this gate only validates, never deploys.
+name: premerge
+on:
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  deploy-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Mail deploy workflow contract suite
+        run: |
+          set -euo pipefail
+          # MAIL-86: the deploy-contract suite is pure-Python (reads the deploy
+          # workflow files and asserts the MAIL-80 retry/lifecycle contract).
+          # No cluster access, no network — fail-fast on any regression.
+          python3 .forgejo/scripts/verify_deploy_values_path.py

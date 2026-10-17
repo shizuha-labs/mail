@@ -1,0 +1,10 @@
+# CI builds install dependencies and generate static assets from source.
+frontend/node_modules
+frontend/dist
+**/node_modules
+**/.vite
+.venv
+venv
+__pycache__
+.pytest_cache
+.ruff_cache

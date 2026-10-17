@@ -1,0 +1,12 @@
+PLAT-4398 exact-head frontend verification
+==========================================
+- postcss ^8.5.10 override → lock 8.5.19 (GHSA-qx2v-qp2m-jg93)
+- public registry.npmjs.org URLs; 0 npm-cache.registry.svc
+- @shizuha/ui: file:../packages/shizuha-ui + committed packages/shizuha-ui
+- npm ci --legacy-peer-deps: EXIT 0
+- node scripts/postcss-style-escape-regression.mjs: ok (stringify escapes </style>)
+- npm run test:unit: PASS (6/6)
+- frontend/Dockerfile.ci production build: PASS
+- npm audit: no postcss finding (remaining findings are tracked separately)
+- npm run lint: N/A — main has no ESLint configuration, so the existing script cannot run
+- Malicious-string: regression script pins floor; Mail does not postcss.stringify untrusted CSS

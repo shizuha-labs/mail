@@ -1,0 +1,6 @@
+# Shizuha MCP Server Dependencies
+mcp>=1.28.1,<2.0.0  # security floor: CVE-2025-53365/53366, CVE-2025-66416, CVE-2026-52869, CVE-2026-59950 (fixed 1.28.1); <2.0.0 because 2.x removed mcp.server.fastmcp
+requests>=2.28.0
+PyJWT>=2.14.0       # security floor: CVE-2026-32597, CVE-2026-48522/48524/48525/48526, CVE-2026-102268
+idna>=3.15          # transitive constraint (isolated mcp-server env): CVE-2024-3651 / idna codec DoS
+python-multipart>=0.0.31  # transitive constraint (isolated mcp-server env): CVE-2025-10867 / multipart DoS

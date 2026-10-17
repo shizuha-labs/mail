@@ -1,0 +1,28 @@
+PLAT-4395 exact-head frontend verification
+==========================================
+
+security-ci run #71 diagnosis (commit d184c3d, superseded)
+- Failing step class: Install Semgrep/Bandit/uv via bare `python3 -m pip install`
+  on PEP 668 externally-managed runner image (hard-fail ~30–60s before scanners).
+- Durable fix on tip: .forgejo/workflows/security-ci.yml job-local venv
+  (RUNNER_TEMP/sec-ci-venv) — same as mail PR #4 4344aa8.
+- Tip security-ci run #82 SUCCESS on 809aca6; re-verify after this commit.
+
+Lock topology (revi P1)
+- package.json: "@shizuha/ui": "file:../packages/shizuha-ui" (aligned with lock)
+- packages/shizuha-ui committed workspace package (version 1.0.0)
+- node_modules/@shizuha/ui → resolved ../packages/shizuha-ui, link:true
+- NO ../../../../packages/shizuha-ui entry; NO extraneous on workspace package
+- js-yaml 4.3.0 @ https://registry.npmjs.org/ (override ^4.2.0)
+
+Exact-head commands (clean tree)
+1. cd frontend && rm -rf node_modules && npm ci --legacy-peer-deps
+   → EXIT 0, 357 packages, js-yaml 4.3.0, @shizuha/ui linked
+2. node scripts/js-yaml-version-check.mjs → ok
+3. VITE_BASE_PATH=/mail/ VITE_API_BASE=/mail/api npm run build → success ~2.2s
+4. Full frontend unit tests: N/A — package.json has no test script beyond eslint;
+   no .eslintrc in repo (main same). Production build is the SPA verification surface.
+5. Repeated-merge-alias / YAML parse: N/A — Mail SPA does not call js-yaml on
+   untrusted input; override is transitive floor (GHSA-h67p-54hq-rp68).
+
+Product: js-yaml >=4.2.0 floor satisfied at 4.3.0.

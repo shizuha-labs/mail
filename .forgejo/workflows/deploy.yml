@@ -1,0 +1,601 @@
+# Shizuha Origin CI/CD — MULTI-ARCH build + deploy shizuha-mail backend (PLAT-1270 probe: mail had no backend deploy workflow; class fix from notes#29/PLAT-1022).
+# Lives in the mail repo and triggers directly from pushes to Shizuha Origin.
+# Builds shizuha-mail for BOTH amd64 + arm64 via two in-cluster kaniko Jobs (arch-matched nodes),
+# combines them into a multi-arch manifest list with crane, deploys the list, and verifies.
+# Multi-arch = the image runs on any platform node (s1 amd64 OR gx10 arm64) per PLAT-718 —
+# no single-arch regression / exec-format crashes. Auth = KUBE_CONFIG_B64 org secret
+# (least-privilege origin-ci-deployer SA). No submodule checkout, no docker-in-DinD.
+name: deploy-shizuha-mail
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+    paths:
+      - Dockerfile
+      - docker-entrypoint.sh
+      - supervisord.conf
+      - supervisord-compat.py
+      - manage.py
+      - pyproject.toml
+      - uv.lock
+      - mail/**
+      - mailmanager/**
+      - mcp-server/**
+      - .forgejo/scripts/deploy-values-path.py
+      - .forgejo/scripts/verify_deploy_values_path.py
+      - .forgejo/workflows/deploy.yml
+# Serialize releases. Canceling a job while `helm upgrade --wait` is active
+# leaves Helm's release transaction in pending-upgrade and blocks every later
+# corrective deployment. Cached builds keep the queued path short.
+concurrency:
+  group: deploy-shizuha-mail-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build-and-deploy:
+    runs-on: deploy-lane
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH=$(uname -m); case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; esac
+          curl -fsSL -o kubectl \
+            "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Verify deploy workflow helpers
+        run: python3 .forgejo/scripts/verify_deploy_values_path.py
+      - name: Multi-arch build + deploy + verify
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          TAG="mail-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          NODE_REG="localhost:30500"
+          NPM_CONFIG_REGISTRY="${NPM_CONFIG_REGISTRY:-http://npm-cache.registry.svc.cluster.local:4873/}"
+          PIP_INDEX_URL="${PIP_INDEX_URL:-http://pip-cache.registry.svc.cluster.local/simple/}"
+          PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-pip-cache.registry.svc.cluster.local}"
+          echo "Multi-arch build shizuha-mail:${TAG} (amd64 + arm64)"
+
+          # Build-lane fix (run 421): the Dockerfile's `FROM .../shizuha-mail:<tag>
+          # AS dependency-seed` hardcoded a previous release tag that aged out and
+          # was registry-GC'd -> MANIFEST_UNKNOWN on every fresh build. Resolve the
+          # seed from the LIVE release image instead: the running tag is the only
+          # one guaranteed present and is never GC'd while pinned. Fail-open: no
+          # live image (cold cluster) or live==this build -> strip the seed stage
+          # and build cold (venv bootstrapped + wheels pulled through the LAN cache).
+          LIVE_IMAGE="$(kubectl get deploy -n shizuha shizuha-mail -o jsonpath='{.spec.template.spec.containers[?(@.name=="shizuha-mail")].image}' 2>/dev/null || true)"
+          LIVE_TAG="${LIVE_IMAGE##*:}"
+          if [ -n "${LIVE_TAG}" ] && [ "${LIVE_TAG}" != "${TAG}" ]; then
+            SEED_TAG="${LIVE_TAG}"
+          else
+            SEED_TAG=""
+          fi
+          echo "dependency-seed: ${SEED_TAG:-(cold build — seed stage stripped)}"
+
+          # TTL only removes terminal Jobs. A kubelet image pull can remain
+          # Pending forever, so clear any serialized predecessor and give
+          # every newly-created Job a hard execution bound.
+          kubectl delete job -n build -l shizuha.io/orig-task=MAIL-48 \
+            --ignore-not-found --wait=false
+
+          render_build_job() {  # $1=arch
+            local ARCH="$1"
+            local SEED_BLOCK
+            if [ -n "$SEED_TAG" ]; then
+              # Single line: the block is spliced into the init container's
+              # quoted YAML scalar — embedded newlines break kubectl's parse.
+              SEED_BLOCK="sed -i 's#FROM registry.registry.svc.cluster.local:5000/shizuha-mail:[^ ]* AS dependency-seed#FROM registry.registry.svc.cluster.local:5000/shizuha-mail:${SEED_TAG} AS dependency-seed#' Dockerfile && grep -q 'shizuha-mail:${SEED_TAG} AS dependency-seed' Dockerfile || { echo '::error::dependency-seed rewrite failed'; exit 1; }"
+            else
+              SEED_BLOCK="sed -i '/AS dependency-seed/d' Dockerfile && sed -i 's#COPY --from=dependency-seed /app/.venv /app/.venv#RUN python -m venv /app/.venv#' Dockerfile && grep -q 'python -m venv /app/.venv' Dockerfile || { echo '::error::cold-build seed strip failed'; exit 1; }"
+            fi
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-build-shizuha-mail-${SHORT}-${ARCH}
+            namespace: build
+            labels: { app: ci-build, shizuha.io/orig-task: ORIG-7 }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 2100
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: ${ARCH} }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                  # amd64 kaniko on i9-ws times out pushing to registry ClusterIP;
+                  # s1 overlay works and carries operator=unschedulable. CI tolerates
+                  # the operator-hold taint instead of removing it.
+                  - { key: operator, operator: Equal, value: unschedulable, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                        # i9-ws overlay to ns registry is i/o timeout. Keep excluded until
+                        # ClusterIP/FORWARD on i9-ws is actually fixed.
+                        - { key: kubernetes.io/hostname, operator: NotIn, values: [i9-ws] }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/mail.git /workspace/src
+                        cd /workspace/src
+                        EXPECTED_SHA="${{ github.sha }}"
+                        if ! git checkout "\${EXPECTED_SHA}" 2>/dev/null; then
+                          echo "sha not in depth=50 clone; deepening and retrying"
+                          git fetch --depth=500 origin "\${EXPECTED_SHA}" || git fetch --unshallow origin
+                          git checkout "\${EXPECTED_SHA}"
+                        fi
+                        ACTUAL_SHA="\$(git rev-parse HEAD)"
+                        if [ "\${ACTUAL_SHA}" != "\${EXPECTED_SHA}" ]; then
+                          echo "::error::checked out \${ACTUAL_SHA}, expected \${EXPECTED_SHA}"
+                          exit 1
+                        fi
+                        # Re-point (or strip) the dependency-seed base stage. Rendered
+                        # at workflow time from the live release tag; see the runner's
+                        # SEED_TAG resolution above.
+                        ${SEED_BLOCK}
+                        if [ -f /workspace/src/Dockerfile ]; then
+                          awk '''
+                            /^FROM[[:space:]]/ {
+                              print
+                              print "ARG NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/"
+                              print "ARG PIP_INDEX_URL=http://pip-cache.registry.svc.cluster.local/simple/"
+                              print "ARG PIP_TRUSTED_HOST=pip-cache.registry.svc.cluster.local"
+                              print "ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}"
+                              print "ENV PIP_INDEX_URL=${PIP_INDEX_URL}"
+                              print "ENV PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}"
+                              next
+                            }
+                            { print }
+                          ''' /workspace/src/Dockerfile > /workspace/src/Dockerfile.cache-wired
+                          mv /workspace/src/Dockerfile.cache-wired /workspace/src/Dockerfile
+                        fi
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src
+                      - --dockerfile=/workspace/src/Dockerfile
+                      - --destination=${REG}/shizuha-mail:${TAG}-${ARCH}
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
+                      - --build-arg=NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/
+                      - --build-arg=PIP_INDEX_URL=http://pip-cache.registry.svc.cluster.local/simple/
+                      - --build-arg=PIP_TRUSTED_HOST=pip-cache.registry.svc.cluster.local
+                      - --cache=true
+                      - --cache-copy-layers=true
+                      - --cache-run-layers=true
+                      - --cache-ttl=168h
+                      - --cache-repo=${REG}/shizuha-mail-buildcache-${ARCH}
+                      - --cleanup
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          }
+
+          # Launch both arch builds in parallel
+          BUILD_GUARD_CONFIGMAP="origin-ci-build-guard-650fec631781"
+          BUILD_GUARD_SHA256="650fec631781edce0e4980f0fb07b12ab78b67b1faf780b214d12a40f9dddcf6"
+          BUILD_GUARD="${RUNNER_TEMP:-/tmp}/origin-ci-build-guard.py"
+          kubectl get "configmap/${BUILD_GUARD_CONFIGMAP}" -n origin \
+            -o jsonpath='{.data.guard\.py}' >"$BUILD_GUARD"
+          echo "${BUILD_GUARD_SHA256}  ${BUILD_GUARD}" | sha256sum -c -
+          job_name_for_arch() {
+            local ARCH="$1"
+            render_build_job "$ARCH" | awk '$1 == "name:" { print $2; exit }'
+          }
+          AMD64_JOB="$(job_name_for_arch amd64)"
+          ARM64_JOB="$(job_name_for_arch arm64)"
+          test -n "$AMD64_JOB" -a -n "$ARM64_JOB"
+          cleanup_build_pair() {
+            python3 "$BUILD_GUARD" cleanup \
+              --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+          }
+          cleanup_on_failure() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then cleanup_build_pair || true; fi
+            exit "$rc"
+          }
+          trap cleanup_on_failure EXIT INT TERM
+          python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+          cleanup_build_pair
+          render_build_job amd64 | kubectl apply -f -
+          render_build_job arm64 | kubectl apply -f -
+          python3 "$BUILD_GUARD" wait-pair --namespace build \
+            --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+            --timeout-seconds 1800
+          trap - EXIT INT TERM
+
+          wait_job() {  # $1=arch, $2=attempt
+            local arch="$1" attempt="${2:-1}"
+            local J="ci-build-shizuha-mail-${SHORT}-${arch}"
+            local logfile="kaniko-${arch}-attempt${attempt}.log"
+            # Poll the Job's conditions instead of `kubectl wait`: a finished
+            # Job is reaped by ttlSecondsAfterFinished long before a 1800s
+            # wait expires, and `kubectl wait --for=condition=complete` NEVER
+            # returns on a reaped (NotFound) job — the PLAT-7253 hole that
+            # made every failure invisible (observed 2026-09-06: three
+            # consecutive builds burned 1800s each and the capture step then
+            # found `jobs.batch ... not found`). Poll every 10s and capture
+            # logs at the FIRST terminal condition, while the Job object
+            # still exists. The rc must not trip `set -e` (see PR#58).
+            local deadline=$((SECONDS + 1800)) cond="" rc=0
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              cond=$(kubectl get "job/${J}" -n build -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || echo NOTFOUND)
+              if grep -q '^Complete=True' <<<"$cond"; then
+                echo "kaniko ${arch} build OK (attempt ${attempt})"
+                return 0
+              fi
+              if grep -q '^Failed=True' <<<"$cond"; then
+                rc=1
+                break
+              fi
+              if [ "$cond" = "NOTFOUND" ]; then
+                rc=1
+                break
+              fi
+              sleep 10
+            done
+            if [ "$rc" -eq 0 ]; then
+              rc=1
+              cond="TIMEOUT"
+            fi
+            local reason="wait timeout (1800s) — cold build cache likely"
+            case "$cond" in
+              NOTFOUND) reason="job reaped (ttlSecondsAfterFinished) before completion could be observed" ;;
+              Failed=True*) reason="job failed" ;;
+            esac
+            echo "::error::kaniko ${arch} build ${reason} (attempt ${attempt})"
+            # Durable log capture BEFORE deleting the Job (the run blob can be
+            # lost on the Forgejo log route, so keep a local copy to upload).
+            # On the reaped path the Job object is already gone — say so
+            # explicitly instead of writing a misleading empty logfile.
+            if [ "$cond" = "NOTFOUND" ]; then
+              printf 'kaniko %s job was reaped before logs could be captured; the build Job ttl stays 300s (MAIL-86 bound); the poll-loop capture lands well inside the reap window\n' "$arch" | tee "$logfile"
+            else
+              kubectl logs -n build "job/${J}" --all-containers --tail=200 > "$logfile" 2>&1 || true
+              echo "kaniko ${arch} logs captured to ${logfile}; tail:"
+              tail -40 "$logfile" || true
+            fi
+            if [ "$attempt" -lt 2 ]; then
+              echo "kaniko ${arch} retrying once (first-attempt cold-cache robustness, PLAT-6113)..."
+              kubectl delete -n build "job/${J}" --ignore-not-found >/dev/null 2>&1 || true
+              for i in $(seq 1 30); do
+                kubectl get "job/${J}" -n build >/dev/null 2>&1 || break
+                sleep 2
+              done
+              render_build_job "$arch" | kubectl apply -f - || {
+                echo "::error::kaniko ${arch} relaunch failed"; exit 1; }
+              wait_job "$arch" 2
+              return $?
+            fi
+            echo "::error::kaniko ${arch} build failed after retry"
+            exit 1
+          }
+          wait_job amd64 1 &
+          AMD64_WAIT_PID=$!
+          wait_job arm64 1 &
+          ARM64_WAIT_PID=$!
+          WAIT_STATUS=0
+          wait "$AMD64_WAIT_PID" || WAIT_STATUS=$?
+          wait "$ARM64_WAIT_PID" || WAIT_STATUS=$?
+          [ "$WAIT_STATUS" -eq 0 ] || exit "$WAIT_STATUS"
+          echo "Both arch builds done."
+
+          # Combine into a multi-arch manifest list with crane
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-manifest-shizuha-mail-${SHORT}
+            namespace: build
+            labels: { app: ci-manifest, shizuha.io/orig-task: ORIG-7 }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 600
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: crane
+                    image: gcr.io/go-containerregistry/crane:v0.20.3
+                    # Image entrypoint IS the crane binary (distroless, no shell) — pass args directly.
+                    args:
+                      - index
+                      - append
+                      - --insecure
+                      - -t
+                      - ${REG}/shizuha-mail:${TAG}
+                      - -m
+                      - ${REG}/shizuha-mail:${TAG}-amd64
+                      - -m
+                      - ${REG}/shizuha-mail:${TAG}-arm64
+          YAML
+          kubectl wait -n build --for=condition=complete "job/ci-manifest-shizuha-mail-${SHORT}" --timeout=300s || {
+            echo "::error::manifest combine failed"; kubectl logs -n build "job/ci-manifest-shizuha-mail-${SHORT}" --tail=30 || true; exit 1; }
+
+          # Run the release-blocking authz tests and runtime dependency smoke from
+          # the exact candidate image. Dependencies are installed once by the
+          # image build instead of again in a separate pre-build runner job.
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-verify-shizuha-mail-${SHORT}
+            namespace: build
+            labels: { app: ci-verify, shizuha.io/orig-task: MAIL-48 }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 600
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: verify
+                    # Kubelet image pulls happen from the node, outside cluster
+                    # DNS. Use the node-reachable registry endpoint here; build
+                    # and manifest jobs can continue using the in-cluster name.
+                    image: ${NODE_REG}/shizuha-mail:${TAG}
+                    command: ["/bin/bash", "-c"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        export DJANGO_SETTINGS_MODULE=mailmanager.ci_test_settings
+                        python manage.py test \
+                          mail.tests.test_revocation_transport \
+                          mail.tests.test_safe_entrypoint \
+                          mail.tests.integration.test_mail48_cross_owner_authz \
+                          mail.tests.integration.test_api \
+                          mail.tests.unit.test_mail55_filters_applied \
+                          mail.tests.unit.test_mail74_delegated_token \
+                          mail.tests.unit.test_managed_identity_sync \
+                          mail.tests.unit.test_required_signing_key \
+                          mail.tests.unit.test_required_credential_configuration -v2
+                        python mcp-server/test_token_verifier.py
+                        python mcp-server/test_folder_selector.py
+                        python mcp-server/test_mail_agent_surface.py
+                        celery --version
+                        /usr/bin/python3 /usr/bin/supervisord --version
+                        python -c 'from mcp.server.mcpserver import MCPServer; import django_celery_beat; import celery; print("candidate dependency smoke OK")'
+          YAML
+          # PLAT-8753: bounded poll observing BOTH terminal job conditions —
+          # a plain `wait --for=condition=complete` never matches a Failed
+          # job (backoffLimit 0) and burned its whole timeout blind. 600s
+          # equals the Job's activeDeadlineSeconds above, so the poll always
+          # outlives the pod; a Failed job surfaces immediately with
+          # get/describe diagnostics (pre-container failures produce NO
+          # container logs).
+          poll_deadline=$((SECONDS + 600))
+          job_complete=false
+          while ((SECONDS < poll_deadline)); do
+            complete="$(kubectl get job "ci-verify-shizuha-mail-${SHORT}" -n build -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)"
+            failed="$(kubectl get job "ci-verify-shizuha-mail-${SHORT}" -n build -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+            if [ "$complete" = True ] || [ "$failed" = True ]; then break; fi
+            sleep 5
+          done
+          if [ "$complete" != True ]; then
+            echo "::error::candidate authz/dependency verification failed"
+            echo "--- job pods (phase visibility: Pending/ImagePullBackOff/mount hang produce NO container logs) ---"
+            kubectl get pods -n build -l "job-name=ci-verify-shizuha-mail-${SHORT}" -o wide || true
+            kubectl describe pods -n build -l "job-name=ci-verify-shizuha-mail-${SHORT}" | tail -60 || true
+            echo "--- container logs (empty above = container never started) ---"
+            kubectl logs -n build "job/ci-verify-shizuha-mail-${SHORT}" --all-containers --tail=100 || true
+            exit 1
+          fi
+
+          # The deploy chart is the sole desired-state authority, and the
+          # central lifecycle is the sole Helm/workload writer. The service
+          # workflow only promotes the immutable candidate and observes the
+          # lifecycle's reconciliation.
+          command -v helm >/dev/null 2>&1 || {
+            HELM_ARCH="$(uname -m)"
+            case "${HELM_ARCH}" in
+              x86_64) HELM_ARCH=amd64 ;;
+              aarch64|arm64) HELM_ARCH=arm64 ;;
+              *) echo "::error::unsupported runner architecture: ${HELM_ARCH}"; exit 1 ;;
+            esac
+            curl -fsSL \
+              "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/helm/v3.16.4/helm-v3.16.4-linux-${HELM_ARCH}.tar.gz" | tar xz
+            install -m 0755 "linux-${HELM_ARCH}/helm" /usr/local/bin/helm
+          }
+          FGJO_URL="http://forgejo-http.origin.svc.cluster.local"
+          FGJO_HOST="origin.shizuha.com"
+          VALS_PATH="k3s%2Fcharts%2Fshizuha-mail%2Fvalues.yaml"
+          VALS_URL="${FGJO_URL}/api/v1/repos/shizuha-labs/deploy/contents/${VALS_PATH}"
+          PROMOTED=false
+          for write_attempt in $(seq 1 10); do
+            curl -fsS --retry 4 --retry-all-errors --retry-delay 2 \
+              -H "Host: ${FGJO_HOST}" \
+              -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+              "${VALS_URL}" \
+              -o /tmp/mail-values-response.json
+            FILE_SHA="$(python3 -c 'import json; print(json.load(open("/tmp/mail-values-response.json"))["sha"])')"
+            python3 - <<'PY'
+          import base64
+          import json
+          from pathlib import Path
+
+          response = json.loads(Path("/tmp/mail-values-response.json").read_text())
+          Path("/tmp/mail-values.yaml").write_bytes(base64.b64decode(response["content"]))
+          PY
+            CURRENT_MAIL_TAG="$(python3 .forgejo/scripts/deploy-values-path.py get /tmp/mail-values.yaml image.tag)"
+            if [ "${CURRENT_MAIL_TAG}" = "${TAG}" ]; then
+              echo "deploy repo already desires ${TAG}"
+              break
+            fi
+            python3 .forgejo/scripts/deploy-values-path.py set /tmp/mail-values.yaml image.tag "${TAG}" >/dev/null
+            NEW_B64="$(base64 -w0 < /tmp/mail-values.yaml)"
+            BODY="$(python3 - "${TAG}" "${NEW_B64}" "${FILE_SHA}" <<'PY'
+          import json
+          import sys
+
+          print(json.dumps({
+              "message": f"ci(shizuha-mail): desired image tag {sys.argv[1]}",
+              "content": sys.argv[2],
+              "sha": sys.argv[3],
+              "branch": "master",
+              "committer": {"email": "ci@shizuha.com", "name": "Origin CI"},
+          }))
+          PY
+          )"
+            UPDATE_STATUS="$(curl -sS -o /tmp/mail-values-update.json -w '%{http_code}' \
+              -X PUT -H "Host: ${FGJO_HOST}" \
+              -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              "${FGJO_URL}/api/v1/repos/shizuha-labs/deploy/contents/${VALS_PATH}" \
+              -d "${BODY}")"
+            case "${UPDATE_STATUS}" in
+              200|201)
+                PROMOTED=true
+                echo "deploy repo desired backend tag updated to ${TAG}"
+                break
+                ;;
+              409|500|502|503)
+                echo "deploy values changed concurrently; retrying fresh read after transient HTTP ${UPDATE_STATUS} (${write_attempt}/10)"
+                sleep 2
+                ;;
+              *)
+                echo "::error::deploy values update failed with HTTP ${UPDATE_STATUS}" >&2
+                cat /tmp/mail-values-update.json >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          curl -fsS --retry 4 --retry-all-errors --retry-delay 2 \
+            -H "Host: ${FGJO_HOST}" \
+            -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+            "${VALS_URL}" \
+            -o /tmp/mail-values-final.json
+          python3 - <<'PY'
+          import base64
+          import json
+          from pathlib import Path
+
+          response = json.loads(Path("/tmp/mail-values-final.json").read_text())
+          Path("/tmp/mail-values-final.yaml").write_bytes(base64.b64decode(response["content"]))
+          PY
+          FINAL_MAIL_TAG="$(python3 .forgejo/scripts/deploy-values-path.py get /tmp/mail-values-final.yaml image.tag)"
+          test "${FINAL_MAIL_TAG}" = "${TAG}" || {
+            echo "::error::deploy chart tag ${FINAL_MAIL_TAG} != promoted ${TAG}" >&2
+            exit 1
+          }
+          echo "deploy chart authoritatively records ${TAG}"
+
+          # A rerun can find the canonical tag already promoted after a prior
+          # lifecycle failure. With no new chart commit to emit a push event,
+          # explicitly request the same central reconciler.
+          if [ "${PROMOTED}" != true ]; then
+            DISPATCH_CODE="$(curl -sS -o /tmp/mail-lifecycle-dispatch.json -w '%{http_code}' \
+              -X POST -H "Host: ${FGJO_HOST}" \
+              -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+              -H 'Content-Type: application/json' \
+              "${FGJO_URL}/api/v1/repos/shizuha-labs/deploy/actions/workflows/deploy-id-mail-lifecycle.yml/dispatches" \
+              -d '{"ref":"master"}' || true)"
+            test "${DISPATCH_CODE}" = 204 || {
+              echo "::error::lifecycle dispatch returned HTTP ${DISPATCH_CODE}" >&2
+              exit 1
+            }
+            echo "central lifecycle reconcile dispatched for existing desired tag ${TAG}"
+          fi
+
+          EXPECTED_IMAGE="localhost:30500/shizuha-mail:${TAG}"
+          deployment_converged() {
+            kubectl get deploy -n shizuha "$1" -o json 2>/dev/null | python3 -c '
+          import json, sys
+          deployment = json.load(sys.stdin)
+          metadata, spec, status = deployment["metadata"], deployment["spec"], deployment.get("status", {})
+          replicas = spec.get("replicas", 1)
+          ok = (
+              status.get("observedGeneration", 0) >= metadata.get("generation", 0)
+              and status.get("updatedReplicas", 0) == replicas
+              and status.get("availableReplicas", 0) == replicas
+              and status.get("readyReplicas", 0) == replicas
+          )
+          raise SystemExit(0 if ok else 1)
+          '
+          }
+          # The lifecycle serially reconciles Mail, Pulse, then ID and can be
+          # queued behind another release. Keep the service workflow attached
+          # to that single writer for a bounded 45 minutes.
+          for attempt in $(seq 1 540); do
+            GET_CODE="$(curl -sS -o /tmp/mail-values-current.json -w '%{http_code}' \
+              -H "Host: ${FGJO_HOST}" \
+              -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+              "${VALS_URL}" || true)"
+            CURRENT_DESIRED_TAG=""
+            if [ "${GET_CODE}" = 200 ]; then
+              python3 - <<'PY'
+          import base64
+          import json
+          from pathlib import Path
+
+          response = json.loads(Path("/tmp/mail-values-current.json").read_text())
+          Path("/tmp/mail-values-current.yaml").write_bytes(base64.b64decode(response["content"]))
+          PY
+              CURRENT_DESIRED_TAG="$(python3 .forgejo/scripts/deploy-values-path.py get /tmp/mail-values-current.yaml image.tag)"
+            fi
+            if [ -n "${CURRENT_DESIRED_TAG}" ] && [ "${CURRENT_DESIRED_TAG}" != "${TAG}" ]; then
+              echo "Mail desired state advanced to ${CURRENT_DESIRED_TAG}; this run is superseded"
+              exit 0
+            fi
+            LIVE="$(kubectl get deploy -n shizuha shizuha-mail -o json | python3 -c 'import json,sys; deployment=json.load(sys.stdin); print(next(container["image"] for container in deployment["spec"]["template"]["spec"]["containers"] if container["name"] == "shizuha-mail"))' 2>/dev/null || true)"
+            STORED_TAG="$(helm get values shizuha-mail -n shizuha -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("image",{}).get("tag",""))' 2>/dev/null || true)"
+            if [ "${CURRENT_DESIRED_TAG}" = "${TAG}" ] \
+              && [ "${STORED_TAG}" = "${TAG}" ] \
+              && [ "${LIVE}" = "${EXPECTED_IMAGE}" ] \
+              && deployment_converged shizuha-mail; then
+              echo "Chart, Helm, and ready Mail workload converged on attempt ${attempt}"
+              break
+            fi
+            if [ "${attempt}" = 540 ]; then
+              echo "::error::central lifecycle did not converge Mail release" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+          # Preserve the deploy-drift accounting contract only after the
+          # chart-authoritative rollout is fully observed.
+          GRACE_UNTIL="$(date -u -d '+30 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+          kubectl annotate -n shizuha deploy/shizuha-mail --overwrite \
+            shizuha.io/desired-image="${EXPECTED_IMAGE}" \
+            shizuha.io/desired-container="shizuha-mail" \
+            shizuha.io/deploy-drift-grace-until="${GRACE_UNTIL}" \
+            shizuha.io/last-successful-sha="${{ github.sha }}"
+
+      # PLAT-6113: retain kaniko build logs durably even when the run blob is
+      # lost on the Forgejo log route. The wait_job helper writes
+      # kaniko-<arch>-attempt<N>.log into the runner workspace on failure;
+      # upload them as artifacts so a red first attempt is diagnosable without
+      # a manual rerun.
+      - name: Upload kaniko build logs (durable)
+        if: always()
+        run: |
+          if ls kaniko-*.log >/dev/null 2>&1; then
+            mkdir -p /tmp/kaniko-logs
+            cp kaniko-*.log /tmp/kaniko-logs/ 2>/dev/null || true
+            ls -la /tmp/kaniko-logs/
+          else
+            echo "no kaniko failure logs captured this run"
+          fi
