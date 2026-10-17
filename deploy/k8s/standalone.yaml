@@ -1,0 +1,75 @@
+# PLAT-353 mail OIDC pilot — STANDALONE test instance (isolated from live mail).
+# Verifies "Sign in with Shizuha ID" end-to-end before the move-out is concluded.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shizuha-mail-standalone
+  namespace: shizuha
+  labels: {app: shizuha-mail-standalone, pilot: plat-353}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: shizuha-mail-standalone}}
+  template:
+    metadata:
+      labels: {app: shizuha-mail-standalone, pilot: plat-353}
+    spec:
+      nodeSelector: {kubernetes.io/hostname: s1}
+      tolerations:
+      - {key: node.shizuha/workstation, operator: Exists, effect: NoSchedule}
+      containers:
+      - name: mail
+        image: localhost:30500/shizuha-mail:oidc-pilot-28d8cf7
+        ports: [{containerPort: 8014}]
+        env:
+        - name: POSTGRES_HOST
+          valueFrom:
+            configMapKeyRef: {name: shizuha-mail-installation, key: POSTGRES_HOST}
+        - {name: POSTGRES_PORT, value: "5432"}
+        - {name: POSTGRES_USER, value: "postgres"}
+        - name: POSTGRES_PASSWORD
+          valueFrom: {secretKeyRef: {name: shizuha-secrets, key: postgres-password}}
+        - {name: POSTGRES_DB, value: "shizuha_mail"}
+        # HS256 grace key present for now; flipped off later via MAIL_DISABLE_HS256
+        - name: JWT_SECRET_KEY
+          valueFrom: {secretKeyRef: {name: shizuha-secrets, key: jwt-secret}}
+        - name: SHIZUHA_ID_API_URL
+          valueFrom:
+            configMapKeyRef: {name: shizuha-mail-installation, key: SHIZUHA_ID_API_URL}
+        - name: CELERY_BROKER_URL
+          valueFrom:
+            configMapKeyRef: {name: shizuha-mail-installation, key: CELERY_BROKER_URL}
+        - name: CELERY_RESULT_BACKEND
+          valueFrom:
+            configMapKeyRef: {name: shizuha-mail-installation, key: CELERY_RESULT_BACKEND}
+        - {name: DEBUG, value: "0"}
+        - {name: SERVER_PORT, value: "8014"}
+        - {name: ALLOWED_HOSTS, value: "*"}
+        # ---- OIDC decoupling (PLAT-353) ----
+        - name: SHIZUHA_OAUTH_CLIENT_ID
+          valueFrom: {secretKeyRef: {name: shizuha-mail-oauth, key: OAUTH_CLIENT_ID}}
+        - name: SHIZUHA_OAUTH_CLIENT_SECRET
+          valueFrom: {secretKeyRef: {name: shizuha-mail-oauth, key: OAUTH_CLIENT_SECRET}}
+        # MAIL-9 credential encryption key; stored separately from DB ciphertext.
+        - name: MAIL_CREDENTIAL_ENCRYPTION_KEY
+          valueFrom: {secretKeyRef: {name: shizuha-mail-credentials, key: ENCRYPTION_KEY}}
+        - {name: MAIL_CREDENTIAL_KEY_ID, value: "mail-credentials-v1"}
+        - {name: SHIZUHA_OAUTH_ISSUER, value: "http://shizuha-id.shizuha.svc.cluster.local:8001"}
+        - {name: SHIZUHA_OAUTH_AUTHORIZE_URL, value: "http://shizuha-id.shizuha.svc.cluster.local:8001/oauth/authorize"}
+        - {name: SHIZUHA_OAUTH_JWKS_URL, value: "http://shizuha-id.shizuha.svc.cluster.local:8001/.well-known/jwks.json"}
+        - {name: SHIZUHA_EXPECTED_ISSUER, value: "http://shizuha-id.shizuha.svc.cluster.local:8001"}
+        - {name: SHIZUHA_SERVICE_NAME, value: "mail"}
+        - {name: MAIL_PUBLIC_URL, value: "http://mail-oidc-test.shizuha.svc.cluster.local:8014"}
+        - {name: MAIL_FRONTEND_URL, value: "http://mail-oidc-test.shizuha.svc.cluster.local:8014/"}
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shizuha-mail-standalone
+  namespace: shizuha
+  labels: {app: shizuha-mail-standalone, pilot: plat-353}
+spec:
+  selector: {app: shizuha-mail-standalone}
+  ports: [{port: 8014, targetPort: 8014}]

@@ -1,0 +1,60 @@
+{
+  "name": "shizuha-mail-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint . --ext js,jsx --report-unused-disable-directives --max-warnings 0",
+    "test:unit": "npm run test:axios-security && node --test tests/unit/*.test.mjs",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:headed": "playwright test --headed",
+    "test:e2e:debug": "playwright test --debug",
+    "test:axios-security": "node scripts/verify-axios-security.mjs"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.58.1",
+    "@shizuha/ui": "file:vendor/ui.tgz",
+    "@tanstack/react-query": "^5.17.0",
+    "axios": "^1.20.0",
+    "clsx": "^2.1.0",
+    "date-fns": "^3.2.0",
+    "lucide-react": "^0.303.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-hot-toast": "^2.6.0",
+    "react-router-dom": "^7.18.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/typography": "^0.5.10",
+    "@types/react": "^18.2.47",
+    "@types/react-dom": "^18.2.18",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.16",
+    "eslint": "^8.56.0",
+    "eslint-plugin-react": "^7.33.2",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "eslint-plugin-react-refresh": "^0.4.5",
+    "postcss": "^8.5.18",
+    "tailwindcss": "^3.4.1",
+    "vite": "^6.4.3"
+  },
+  "overrides": {
+    "js-yaml": "4.3.2",
+    "minimatch": "^3.1.4",
+    "postcss": "^8.5.18",
+    "picomatch": "^2.3.2",
+    "tinyglobby": {
+      "picomatch": "^4.0.4"
+    },
+    "esbuild": "0.25.12",
+    "rollup": "^4.59.0",
+    "flatted": "^3.4.2",
+    "nanoid": "^3.3.17",
+    "baseline-browser-mapping": "2.11.0",
+    "postcss-selector-parser": "6.1.3"
+  }
+}
