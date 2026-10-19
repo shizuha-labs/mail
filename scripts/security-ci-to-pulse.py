@@ -356,6 +356,56 @@ def origin_observation(args: argparse.Namespace, *, check: str = "security-ci") 
     return {key: value for key, value in values.items() if value}
 
 
+def pulse_create_with_dedupe(
+    api_base: str, token: str, body: dict[str, Any], source_id: str,
+) -> tuple[dict[str, Any], bool]:
+    """POST a finding/ledger item, recovering from the (source, source_id)
+    unique-constraint race (PLAT-5877 root cause).
+
+    ``pulse_find_existing`` can legitimately miss right before a POST: the list
+    serializer exposes neither ``source`` nor ``source_id``, so on Pulse builds
+    without the PLAT-2688 server-side filter the GET returns rows that fail the
+    client check and ``None`` — then the POST collides with the item that IS
+    already there (filed by a concurrent run or an earlier scan) and 400s with
+    "The fields source, source_id must make a unique set". Previously that
+    RuntimeError red the whole filing leg, so the rolling ledger silently
+    stopped updating and downstream observations went stale/phantom.
+
+    Recovery: on that specific 400, re-resolve the existing item (full
+    ``pulse_find_existing`` first, then a plain ``search=`` fallback) and return
+    it with ``created=False`` so the caller takes the update path. Any other
+    400 still raises.
+    """
+    try:
+        return pulse_request("POST", f"{api_base}/items/", token, body), True
+    except RuntimeError as exc:
+        # Capture the message INSIDE the except block: Python 3 deletes the
+        # except-alias when the block exits, so interpolating `exc` in the
+        # fail-loud raise below would surface as NameError instead of the
+        # original diagnostic (PLAT-5877 review).
+        duplicate_error = str(exc)
+        if "must make a unique set" not in duplicate_error:
+            raise
+    existing = pulse_find_existing(api_base, token, source_id)
+    if not existing:
+        # Fallback: search by the unique namespaced token, newest first.
+        q = urllib.parse.urlencode({"search": source_id, "include_archived": "true"})
+        data = pulse_request("GET", f"{api_base}/items/?{q}", token)
+        rows = data.get("results") if isinstance(data, dict) else data
+        for row in rows or []:
+            if row.get("item_key") or row.get("id"):
+                existing = row
+                break
+    if not existing:
+        # Constraint says it exists but we cannot resolve it — surface loudly.
+        raise RuntimeError(
+            f"POST rejected as duplicate for source_id {source_id!r} but the "
+            "item cannot be resolved via source_id/search filters; inspect the "
+            f"Pulse items API manually. Original error: {duplicate_error}"
+        )
+    return existing, False
+
+
 def pulse_create_or_update_finding(api_base: str, token: str, finding: Finding, args: argparse.Namespace) -> str:
     existing = pulse_find_existing(api_base, token, finding.source_id)
     if existing:
@@ -434,7 +484,15 @@ def pulse_create_or_update_finding(api_base: str, token: str, finding: Finding, 
     }
     if args.project_id:
         body["project"] = int(args.project_id)
-    created = pulse_request("POST", f"{api_base}/items/", token, body)
+    created, was_created = pulse_create_with_dedupe(api_base, token, body, finding.source_id)
+    if not was_created:
+        # Lost the find-then-POST race (PLAT-5877): the item exists — take the
+        # dedupe path immediately instead of erroring the filing leg.
+        ref = str(created.get("item_key") or created.get("id"))
+        print(f"WARN: per-finding POST hit the (source, source_id) unique "
+              f"constraint for {finding.source_id}; recovered existing {ref}",
+              file=sys.stderr)
+        return f"skipped-duplicate-race:{ref}"
     ref = created.get("item_key") or created.get("id")
     try:
         if created.get("assignee") or created.get("assignee_id"):
@@ -533,7 +591,24 @@ def pulse_upsert_ledger(api_base: str, token: str, findings: list[Finding], args
     }
     if args.project_id:
         body["project"] = int(args.project_id)
-    created = pulse_request("POST", f"{api_base}/items/", token, body)
+    created, was_created = pulse_create_with_dedupe(api_base, token, body, source_id)
+    if not was_created:
+        # Lost the find-then-POST race (PLAT-5877): the ledger item exists —
+        # PATCH it in place right now instead of erroring the scan leg.
+        ref = str(created.get("item_key") or created.get("id"))
+        print(f"WARN: ledger POST hit the (source, source_id) unique constraint "
+              f"for {source_id}; recovered existing {ref}", file=sys.stderr)
+        try:
+            pulse_request("PATCH", f"{api_base}/items/{created.get('id') or ref}/", token,
+                          {"description": description,
+                           "labels": ["security-ci", "security-ci:ledger",
+                                      f"repo:{args.repo}", hash_label],
+                           "priority": PRIORITY.get(max_sev, "normal"),
+                           "append_origin_observations": [origin_observation(args)]})
+            return f"ledger-updated:{ref}"
+        except Exception as exc:
+            print(f"WARN: ledger race-recovery PATCH failed for {ref}: {exc}", file=sys.stderr)
+            return f"ledger-created-race-recovered:{ref}"
     ref = created.get("item_key") or created.get("id")
     try:
         if created.get("assignee") or created.get("assignee_id"):
