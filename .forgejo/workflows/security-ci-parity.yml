@@ -23,7 +23,7 @@ jobs:
           import pathlib
           import re
 
-          expected_bundle = "963e39ac0e3098338b4feddb373d8b8080531b79b80fd77feddd59f115846428"
+          expected_bundle = "9dc811d94bcfebc455307a8a33d55683ab900367a4fe4645f1a41f56a616729a"
           paths = sorted([
               ".forgejo/workflows/security-ci.yml",
               ".forgejo/workflows/security-ci-parity.yml",
