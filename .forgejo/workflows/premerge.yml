@@ -25,3 +25,5 @@ jobs:
           # workflow files and asserts the MAIL-80 retry/lifecycle contract).
           # No cluster access, no network — fail-fast on any regression.
           python3 .forgejo/scripts/verify_deploy_values_path.py
+          # Arch-aware build selection + image/placement guards (pure stdlib).
+          python3 .forgejo/scripts/test_build_arches.py
