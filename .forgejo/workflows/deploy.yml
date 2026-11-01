@@ -1,7 +1,10 @@
 # Shizuha Origin CI/CD — MULTI-ARCH build + deploy shizuha-mail backend (PLAT-1270 probe: mail had no backend deploy workflow; class fix from notes#29/PLAT-1022).
 # Lives in the mail repo and triggers directly from pushes to Shizuha Origin.
-# Builds shizuha-mail for BOTH amd64 + arm64 via two in-cluster kaniko Jobs (arch-matched nodes),
-# combines them into a multi-arch manifest list with crane, deploys the list, and verifies.
+# Builds shizuha-mail per architecture via in-cluster kaniko Jobs (arch-matched nodes) for every
+# arch that currently has an admissible node (amd64 + arm64 normally; arm64 is required,
+# a skipped arch is a ::warning::), combines them into a manifest list with crane,
+# verifies the list equals the built set, and refuses a rollout whose platforms do not
+# cover the nodes running the Deployment's pods (.forgejo/scripts/build_arches.py).
 # Multi-arch = the image runs on any platform node (s1 amd64 OR gx10 arm64) per PLAT-718 —
 # no single-arch regression / exec-format crashes. Auth = KUBE_CONFIG_B64 org secret
 # (least-privilege origin-ci-deployer SA). No submodule checkout, no docker-in-DinD.
@@ -23,6 +26,8 @@ on:
       - mcp-server/**
       - .forgejo/scripts/deploy-values-path.py
       - .forgejo/scripts/verify_deploy_values_path.py
+      - .forgejo/scripts/build_arches.py
+      - .forgejo/scripts/test_build_arches.py
       - .forgejo/workflows/deploy.yml
 # Serialize releases. Canceling a job while `helm upgrade --wait` is active
 # leaves Helm's release transaction in pending-upgrade and blocks every later
@@ -46,7 +51,10 @@ jobs:
           printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
       - name: Verify deploy workflow helpers
-        run: python3 .forgejo/scripts/verify_deploy_values_path.py
+        run: |
+          set -euo pipefail
+          python3 .forgejo/scripts/verify_deploy_values_path.py
+          python3 .forgejo/scripts/test_build_arches.py 2>&1 | tail -3
       - name: Multi-arch build + deploy + verify
         run: |
           set -euo pipefail
@@ -57,7 +65,7 @@ jobs:
           NPM_CONFIG_REGISTRY="${NPM_CONFIG_REGISTRY:-http://npm-cache.registry.svc.cluster.local:4873/}"
           PIP_INDEX_URL="${PIP_INDEX_URL:-http://pip-cache.registry.svc.cluster.local/simple/}"
           PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-pip-cache.registry.svc.cluster.local}"
-          echo "Multi-arch build shizuha-mail:${TAG} (amd64 + arm64)"
+          echo "Arch-aware build shizuha-mail:${TAG} (candidates: amd64 arm64)"
 
           # Build-lane fix (run 421): the Dockerfile's `FROM .../shizuha-mail:<tag>
           # AS dependency-seed` hardcoded a previous release tag that aged out and
@@ -202,12 +210,35 @@ jobs:
             local ARCH="$1"
             render_build_job "$ARCH" | awk '$1 == "name:" { print $2; exit }'
           }
-          AMD64_JOB="$(job_name_for_arch amd64)"
-          ARM64_JOB="$(job_name_for_arch arm64)"
-          test -n "$AMD64_JOB" -a -n "$ARM64_JOB"
+          # Arch-aware build set (.forgejo/scripts/build_arches.py): build only the
+          # architectures that have a Ready, schedulable node admitting the
+          # rendered build Job (nodeSelector/affinity/taints). arm64 is required;
+          # a skipped arch is reported as ::warning:: and the build returns to
+          # multi-arch automatically once such a node is admissible again.
+          python3 .forgejo/scripts/test_build_arches.py 2>&1 | tail -3
+          ARCH_DIR="$(mktemp -d)"
+          for ARCH in amd64 arm64; do
+            render_build_job "$ARCH" | kubectl create --dry-run=client -o json -f - >"${ARCH_DIR}/job-${ARCH}.json"
+          done
+          python3 .forgejo/scripts/build_arches.py select \
+            --candidate "amd64=${ARCH_DIR}/job-amd64.json" \
+            --candidate "arm64=${ARCH_DIR}/job-arm64.json" \
+            --require arm64 --output "${ARCH_DIR}/build-arches.txt"
+          read -r -a BUILD_ARCHES <"${ARCH_DIR}/build-arches.txt"
+          test "${#BUILD_ARCHES[@]}" -ge 1
+          ALL_BUILD_JOBS=()
+          BUILD_WAIT_JOBS=()
+          PREFLIGHT_ARCHES=()
+          for ARCH in amd64 arm64; do
+            ALL_BUILD_JOBS+=(--job "$(job_name_for_arch "$ARCH")")
+          done
+          for ARCH in "${BUILD_ARCHES[@]}"; do
+            BUILD_WAIT_JOBS+=(--job "${ARCH}=$(job_name_for_arch "$ARCH")")
+            PREFLIGHT_ARCHES+=(--arch "$ARCH")
+          done
           cleanup_build_pair() {
-            python3 "$BUILD_GUARD" cleanup \
-              --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+            # Reap every candidate arch (a stale job of a now-skipped arch too).
+            python3 "$BUILD_GUARD" cleanup --namespace build "${ALL_BUILD_JOBS[@]}"
           }
           cleanup_on_failure() {
             rc=$?
@@ -215,12 +246,12 @@ jobs:
             exit "$rc"
           }
           trap cleanup_on_failure EXIT INT TERM
-          python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+          python3 "$BUILD_GUARD" preflight "${PREFLIGHT_ARCHES[@]}"
           cleanup_build_pair
-          render_build_job amd64 | kubectl apply -f -
-          render_build_job arm64 | kubectl apply -f -
-          python3 "$BUILD_GUARD" wait-pair --namespace build \
-            --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+          for ARCH in "${BUILD_ARCHES[@]}"; do
+            render_build_job "$ARCH" | kubectl apply -f -
+          done
+          python3 "$BUILD_GUARD" wait-jobs --namespace build "${BUILD_WAIT_JOBS[@]}" \
             --timeout-seconds 1800
           trap - EXIT INT TERM
 
@@ -290,17 +321,20 @@ jobs:
             echo "::error::kaniko ${arch} build failed after retry"
             exit 1
           }
-          wait_job amd64 1 &
-          AMD64_WAIT_PID=$!
-          wait_job arm64 1 &
-          ARM64_WAIT_PID=$!
+          WAIT_PIDS=()
+          for ARCH in "${BUILD_ARCHES[@]}"; do
+            wait_job "$ARCH" 1 &
+            WAIT_PIDS+=("$!")
+          done
           WAIT_STATUS=0
-          wait "$AMD64_WAIT_PID" || WAIT_STATUS=$?
-          wait "$ARM64_WAIT_PID" || WAIT_STATUS=$?
+          for WAIT_PID in "${WAIT_PIDS[@]}"; do
+            wait "$WAIT_PID" || WAIT_STATUS=$?
+          done
           [ "$WAIT_STATUS" -eq 0 ] || exit "$WAIT_STATUS"
-          echo "Both arch builds done."
+          echo "Arch builds done: ${BUILD_ARCHES[*]}"
 
-          # Combine into a multi-arch manifest list with crane
+          # Combine the built per-arch images into a manifest list with crane
+          CRANE_MANIFEST_ARGS="$(for ARCH in "${BUILD_ARCHES[@]}"; do printf '            - -m\n            - %s\n' "${REG}/shizuha-mail:${TAG}-${ARCH}"; done)"
           cat <<YAML | kubectl apply -f -
           apiVersion: batch/v1
           kind: Job
@@ -325,13 +359,17 @@ jobs:
                       - --insecure
                       - -t
                       - ${REG}/shizuha-mail:${TAG}
-                      - -m
-                      - ${REG}/shizuha-mail:${TAG}-amd64
-                      - -m
-                      - ${REG}/shizuha-mail:${TAG}-arm64
+          ${CRANE_MANIFEST_ARGS}
           YAML
           kubectl wait -n build --for=condition=complete "job/ci-manifest-shizuha-mail-${SHORT}" --timeout=300s || {
             echo "::error::manifest combine failed"; kubectl logs -n build "job/ci-manifest-shizuha-mail-${SHORT}" --tail=30 || true; exit 1; }
+
+          # The pushed index must contain exactly the architectures just built.
+          python3 .forgejo/scripts/build_arches.py manifest-platforms \
+            --registry "${REG}" --repo shizuha-mail --tag "${TAG}" \
+            --job-name "ci-platforms-shizuha-mail-${SHORT}" --label shizuha.io/orig-task=MAIL-48 \
+            --expect "${BUILD_ARCHES[*]}" --output /tmp/mail-image-arches.txt
+          IMAGE_ARCHES_CSV="$(sed 's/ /, /g' /tmp/mail-image-arches.txt)"
 
           # Run the release-blocking authz tests and runtime dependency smoke from
           # the exact candidate image. Dependencies are installed once by the
@@ -350,6 +388,13 @@ jobs:
             template:
               spec:
                 restartPolicy: Never
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        # Only nodes whose arch the candidate image was built for.
+                        - { key: kubernetes.io/arch, operator: In, values: [${IMAGE_ARCHES_CSV}] }
                 containers:
                   - name: verify
                     # Kubelet image pulls happen from the node, outside cluster
@@ -402,6 +447,12 @@ jobs:
             kubectl logs -n build "job/ci-verify-shizuha-mail-${SHORT}" --all-containers --tail=100 || true
             exit 1
           fi
+
+          # Never roll an image that cannot run where the pods are: its platforms
+          # must cover the arch of every node running (non-terminating) Mail pods.
+          python3 .forgejo/scripts/build_arches.py check-placement \
+            --platforms "$(cat /tmp/mail-image-arches.txt)" \
+            --deployment shizuha/shizuha-mail
 
           # The deploy chart is the sole desired-state authority, and the
           # central lifecycle is the sole Helm/workload writer. The service

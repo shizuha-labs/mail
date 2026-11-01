@@ -52,54 +52,53 @@ class DeployValuesPathTests(unittest.TestCase):
             "kubectl delete job -n build -l shizuha.io/orig-task=MAIL-48",
             backend,
         )
+        # Inline Jobs: build, manifest (+ candidate verify in the backend). The
+        # image-index verifier Job is rendered by build_arches.py, bounded there.
         self.assertGreaterEqual(backend.count("activeDeadlineSeconds:"), 3)
-        self.assertGreaterEqual(frontend.count("activeDeadlineSeconds:"), 3)
+        self.assertGreaterEqual(frontend.count("activeDeadlineSeconds:"), 2)
+        helper = (ROOT / ".forgejo/scripts/build_arches.py").read_text()
+        self.assertIn('man.add_argument("--timeout-seconds", type=int, default=180)', helper)
+        self.assertIn('"activeDeadlineSeconds": args.timeout_seconds', helper)
+        self.assertIn('"ttlSecondsAfterFinished": 300', helper)
         for label, workflow in (("backend", backend), ("frontend", frontend)):
             with self.subTest(workflow=label):
+                self.assertIn(".forgejo/scripts/build_arches.py manifest-platforms", workflow)
                 ttl_values = [
                     int(value)
                     for value in re.findall(r"ttlSecondsAfterFinished:\s*(\d+)", workflow)
                 ]
-                self.assertGreaterEqual(len(ttl_values), 3)
+                self.assertGreaterEqual(len(ttl_values), 2)
                 self.assertTrue(all(value <= 300 for value in ttl_values))
                 self.assertIn("--cleanup", workflow)
                 self.assertNotIn("--cache=false", workflow)
 
     def test_mail_multiarch_waits_run_concurrently_and_aggregate_failures(self) -> None:
         # MAIL-86: deploy.yml passes the attempt number to wait_job (PLAT-6113
-        # first-attempt cold-cache retry) — `wait_job amd64 1 &`. The frontend
-        # workflow's wait_job takes no attempt arg — `wait_job amd64 &`. Both
-        # must launch the arch waits concurrently and aggregate their status.
+        # first-attempt cold-cache retry); the frontend wait_job takes none.
+        # Both launch one wait per *built* arch (build_arches.py selection)
+        # concurrently and aggregate every status.
         expected = {
-            "deploy.yml": (
-                "wait_job amd64 1 &\n"
-                "          AMD64_WAIT_PID=$!\n"
-                "          wait_job arm64 1 &\n"
-                "          ARM64_WAIT_PID=$!\n"
-                "          WAIT_STATUS=0\n"
-                '          wait "$AMD64_WAIT_PID" || WAIT_STATUS=$?\n'
-                '          wait "$ARM64_WAIT_PID" || WAIT_STATUS=$?\n'
-                '          [ "$WAIT_STATUS" -eq 0 ] || exit "$WAIT_STATUS"'
-            ),
-            "deploy-frontend.yml": (
-                "wait_job amd64 &\n"
-                "          AMD64_WAIT_PID=$!\n"
-                "          wait_job arm64 &\n"
-                "          ARM64_WAIT_PID=$!\n"
-                "          WAIT_STATUS=0\n"
-                '          wait "$AMD64_WAIT_PID" || WAIT_STATUS=$?\n'
-                '          wait "$ARM64_WAIT_PID" || WAIT_STATUS=$?\n'
-                '          [ "$WAIT_STATUS" -eq 0 ] || exit "$WAIT_STATUS"'
-            ),
+            "deploy.yml": 'wait_job "$ARCH" 1 &\n',
+            "deploy-frontend.yml": 'wait_job "$ARCH" &\n',
         }
         for name in ("deploy.yml", "deploy-frontend.yml"):
             workflow = (ROOT / ".forgejo/workflows" / name).read_text()
             with self.subTest(workflow=name):
-                self.assertIn(expected[name], workflow)
-                self.assertNotIn(
-                    "wait_job amd64\n          wait_job arm64",
+                self.assertIn(
+                    "          WAIT_PIDS=()\n"
+                    '          for ARCH in "${BUILD_ARCHES[@]}"; do\n'
+                    "            " + expected[name] +
+                    '            WAIT_PIDS+=("$!")\n'
+                    "          done\n"
+                    "          WAIT_STATUS=0\n"
+                    '          for WAIT_PID in "${WAIT_PIDS[@]}"; do\n'
+                    '            wait "$WAIT_PID" || WAIT_STATUS=$?\n'
+                    "          done\n"
+                    '          [ "$WAIT_STATUS" -eq 0 ] || exit "$WAIT_STATUS"',
                     workflow,
                 )
+                self.assertNotIn("wait_job amd64", workflow)
+                self.assertNotIn("wait_job arm64", workflow)
 
     def test_frontend_promotes_chart_and_waits_for_helm_ownership(self) -> None:
         workflow = (ROOT / ".forgejo/workflows/deploy-frontend.yml").read_text()
